@@ -1,0 +1,299 @@
+from __future__ import print_function
+import re
+import os
+import base64
+import schedule
+import time
+import pdfplumber
+from datetime import datetime, timedelta
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from transformers import DonutProcessor, VisionEncoderDecoderModel
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+from PIL import Image
+import logging
+import json
+
+# Configure logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Scopes and credentials
+SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send',
+          'https://www.googleapis.com/auth/gmail.compose', 'https://mail.google.com/']
+CREDENTIALS_PATH = 'PATH_TO_CREDENTIALS'
+PROCESSED_LABEL = 'processed'
+ATTACHMENTS_DIR = './attachments'
+RECEIVER_EMAIL = "RECIEVER_EMAIL"
+LAST_TIMESTAMP_FILE = 'last_timestamp.json'
+
+# Ensure attachments directory exists
+if not os.path.exists(ATTACHMENTS_DIR):
+    os.makedirs(ATTACHMENTS_DIR)
+
+# Initialize the invoice classification model
+model = VisionEncoderDecoderModel.from_pretrained(
+    "to-be/donut-base-finetuned-invoices")
+processor = DonutProcessor.from_pretrained(
+    "to-be/donut-base-finetuned-invoices")
+
+
+def get_last_timestamp():
+    if os.path.exists(LAST_TIMESTAMP_FILE):
+        with open(LAST_TIMESTAMP_FILE, 'r') as file:
+            return json.load(file).get('last_timestamp')
+    return None
+
+
+def update_last_timestamp(timestamp):
+    with open(LAST_TIMESTAMP_FILE, 'w') as file:
+        json.dump({'last_timestamp': timestamp}, file)
+
+
+def get_gmail_service():
+    creds = None
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+        logging.info("Loaded credentials from token.json")
+    else:
+        logging.info("token.json not found, need to authorize")
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            logging.info("Refreshed credentials")
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                CREDENTIALS_PATH, SCOPES)
+            creds = flow.run_local_server(port=0)
+            logging.info("Completed authorization flow")
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+            logging.info("Saved credentials to token.json")
+
+    logging.info("Building Gmail service")
+    service = build('gmail', 'v1', credentials=creds)
+    logging.info("Gmail service built successfully")
+    return service
+
+
+def extract_invoice_data(image_path):
+    try:
+        image = Image.open(image_path).convert("RGB")
+        pixel_values = processor(image, return_tensors="pt").pixel_values
+        outputs = model.generate(pixel_values)
+        result = processor.decode(outputs[0], skip_special_tokens=True)
+        logging.info(f"Extracted invoice data from {image_path}: {result}")
+        return result
+    except Exception as e:
+        logging.error(f"Error extracting invoice data from {image_path}: {e}")
+        return None
+
+
+def is_invoice(text):
+    invoice_keywords = ["invoice", "bill", "invoice number", "invoice date", "due date", "payment terms", "ordrenr",
+                        "leveringsdato", "referanse", "bankgiro", "vat", "mva", "total due", "amount due", "balance due", "net amount"]
+    patterns = [r"\d{2}/\d{2}/\d{4}", r"\$\d+\.\d{2}", r"invoice\s+no\.\s*\d+"]
+
+    text_lower = text.lower()
+    keyword_found = any(
+        keyword.lower() in text_lower for keyword in invoice_keywords)
+    pattern_found = any(re.search(pattern, text_lower) for pattern in patterns)
+
+    if keyword_found or pattern_found:
+        logging.info(f"Detected invoice content in text: {text[:100]}...")
+        return True
+    return False
+
+
+def fetch_emails(service, last_timestamp):
+    try:
+        query = f'is:unread after:{last_timestamp}' if last_timestamp else 'is:unread'
+        logging.info(
+            f"Fetching unread emails received after: {last_timestamp}")
+        results = service.users().messages().list(userId='me', q=query).execute()
+        messages = results.get('messages', [])
+        return messages
+    except HttpError as error:
+        logging.error(f'An error occurred: {error}')
+        return []
+
+
+def add_label_to_email(service, message_id, label_name):
+    try:
+        label_id = None
+        results = service.users().labels().list(userId='me').execute()
+        labels = results.get('labels', [])
+        for label in labels:
+            if label['name'] == label_name:
+                label_id = label['id']
+                break
+
+        if not label_id:
+            logging.warning(f"Label '{label_name}' not found")
+            return
+
+        service.users().messages().modify(userId='me', id=message_id,
+                                          body={'addLabelIds': [label_id]}).execute()
+        logging.info(f"Label '{label_name}' added to email ID {message_id}")
+    except HttpError as error:
+        logging.error(f'An error occurred while adding label: {error}')
+
+
+def extract_invoice_info(pdf_path):
+    try:
+        if not pdf_path.lower().endswith('.pdf'):
+            logging.info(f"Skipping non-PDF file: {pdf_path}")
+            return None, None
+        with pdfplumber.open(pdf_path) as pdf:
+            first_page = pdf.pages[0]
+            text = first_page.extract_text()
+            logging.info(f"Extracted text from {pdf_path}: {text[:500]}...")
+            if is_invoice(text):
+                return text, None
+            else:
+                logging.info(f"File {pdf_path} is not an invoice.")
+                return None, None
+    except Exception as e:
+        logging.error(f"Error processing PDF {pdf_path}: {e}")
+        return None, None
+
+
+def forward_email(service, message_id, receiver_email, snippet):
+    try:
+        logging.info(f"Fetching full email for message ID: {message_id}")
+        msg = service.users().messages().get(
+            userId='me', id=message_id, format='full').execute()
+
+        headers = msg.get('payload', {}).get('headers', [])
+        parts = msg.get('payload', {}).get('parts', [])
+
+        subject = None
+        for header in headers:
+            if header['name'] == 'Subject':
+                subject = header['value']
+                break
+
+        if not subject:
+            subject = "No Subject"
+
+        forward = MIMEMultipart()
+        forward['to'] = receiver_email
+        forward['from'] = 'me'
+        forward['subject'] = "Fwd: " + subject
+
+        body = MIMEText(
+            f"Forwarding the following email:\n\n{snippet}\n\n", 'plain')
+        forward.attach(body)
+
+        for part in parts:
+            if part['mimeType'] == 'text/plain':
+                text_part = MIMEText(base64.urlsafe_b64decode(
+                    part['body']['data']).decode('utf-8'), 'plain')
+                forward.attach(text_part)
+            elif part['mimeType'] == 'text/html':
+                html_part = MIMEText(base64.urlsafe_b64decode(
+                    part['body']['data']).decode('utf-8'), 'html')
+                forward.attach(html_part)
+            elif 'attachmentId' in part['body']:
+                attachment = service.users().messages().attachments().get(
+                    userId='me', messageId=message_id, id=part['body']['attachmentId']).execute()
+                data = base64.urlsafe_b64decode(attachment['data'])
+                att = MIMEBase('application', 'octet-stream')
+                att.set_payload(data)
+                encoders.encode_base64(att)
+                att.add_header('Content-Disposition',
+                               'attachment', filename=part['filename'])
+                forward.attach(att)
+
+        logging.info(f"Forwarding email to: {receiver_email}")
+        raw_forward = {'raw': base64.urlsafe_b64encode(
+            forward.as_bytes()).decode('UTF-8')}
+        sent_message = service.users().messages().send(
+            userId='me', body=raw_forward).execute()
+        logging.info(
+            f"Email forwarded successfully to {receiver_email}. Sent message ID: {sent_message['id']}")
+
+        logging.info(f"Marking email as read: {message_id}")
+        service.users().messages().modify(userId='me', id=message_id,
+                                          body={'removeLabelIds': ['UNREAD']}).execute()
+
+        add_label_to_email(service, message_id, PROCESSED_LABEL)
+    except HttpError as error:
+        if error.resp.status in [403, 429]:
+            logging.error(f"Quota exceeded: {error}")
+        else:
+            logging.error(
+                f"Error forwarding email to {receiver_email}: {error}")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+
+
+def process_email(service, message):
+    msg = service.users().messages().get(
+        userId='me', id=message['id']).execute()
+    msg_body = msg['snippet']
+    logging.info(
+        f"Processing message ID {message['id']} with snippet: {msg_body[:100]}")
+    email_contains_invoice = is_invoice(msg_body)
+
+    attachments = []
+    if 'parts' in msg['payload']:
+        for part in msg['payload']['parts']:
+            if part['filename'] and 'attachmentId' in part['body']:
+                attachment = service.users().messages().attachments().get(
+                    userId='me', messageId=message['id'], id=part['body']['attachmentId']
+                ).execute()
+                data = base64.urlsafe_b64decode(
+                    attachment['data'].encode('UTF-8'))
+                path = os.path.join(ATTACHMENTS_DIR, part['filename'])
+                with open(path, 'wb') as f:
+                    f.write(data)
+                attachments.append(path)
+                logging.info(f"Downloaded attachment to {path}")
+
+    invoice_detected = email_contains_invoice
+    for pdf in attachments:
+        if pdf.lower().endswith('.pdf'):
+            invoice_data, _ = extract_invoice_info(pdf)
+            if invoice_data:
+                invoice_detected = True
+
+    if invoice_detected:
+        forward_email(service, message['id'], RECEIVER_EMAIL, msg_body)
+        logging.info(
+            f"Invoice detected and email forwarded for message ID {message['id']}")
+    else:
+        logging.info(f"No invoice detected in message ID {message['id']}")
+
+
+def job():
+    logging.info("Running scheduled job to check emails...")
+    main()
+
+
+def main():
+    logging.info("Starting email fetching process")
+    service = get_gmail_service()
+    last_timestamp = datetime.utcnow().strftime('%Y/%m/%d %H:%M:%S')
+    messages = fetch_emails(service, last_timestamp)
+    logging.info(f"Fetched {len(messages)} messages")
+
+    if messages:
+        for message in messages:
+            process_email(service, message)
+        update_last_timestamp(last_timestamp)
+
+
+if __name__ == "__main__":
+    schedule.every(1).minutes.do(job)
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
