@@ -24,7 +24,8 @@ jobs:
         run: |
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run Python script
+      - name: Run script
         run: |
           python main.py
+
 
