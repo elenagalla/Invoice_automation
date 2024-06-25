@@ -27,10 +27,10 @@ logging.basicConfig(level=logging.INFO,
 # Scopes and credentials
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send',
           'https://www.googleapis.com/auth/gmail.compose', 'https://mail.google.com/']
-CREDENTIALS_PATH = 'PATH_TO_CREDENTIALS'
+CREDENTIALS_PATH = 'C:\\Users\\User\\Documents\\GitHub\\elena_project\\autogen\\jsonclient_secret_864676982851-49gtof7lldbis507iao7r0f0r6v95jvl.apps.googleusercontent.com.json'
 PROCESSED_LABEL = 'processed'
 ATTACHMENTS_DIR = './attachments'
-RECEIVER_EMAIL = "RECIEVER_EMAIL"
+RECEIVER_EMAIL = "elena@jarccel.com"
 LAST_TIMESTAMP_FILE = 'last_timestamp.json'
 
 # Ensure attachments directory exists
@@ -66,9 +66,13 @@ def get_gmail_service():
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            logging.info("Refreshed credentials")
-        else:
+            try:
+                creds.refresh(Request())
+                logging.info("Refreshed credentials")
+            except Exception as e:
+                logging.error(f"Error refreshing credentials: {e}")
+                creds = None
+        if not creds:
             flow = InstalledAppFlow.from_client_secrets_file(
                 CREDENTIALS_PATH, SCOPES)
             creds = flow.run_local_server(port=0)
@@ -114,7 +118,7 @@ def is_invoice(text):
 
 def fetch_emails(service, last_timestamp):
     try:
-        query = f'is:unread after:{last_timestamp}' if last_timestamp else 'is:unread'
+        query = f'is:unread'  # Adjusted query for debugging
         logging.info(
             f"Fetching unread emails received after: {last_timestamp}")
         results = service.users().messages().list(userId='me', q=query).execute()
@@ -271,6 +275,10 @@ def process_email(service, message):
             f"Invoice detected and email forwarded for message ID {message['id']}")
     else:
         logging.info(f"No invoice detected in message ID {message['id']}")
+        # Mark the email as read even if no invoice is detected
+        service.users().messages().modify(userId='me', id=message['id'],
+                                          body={'removeLabelIds': ['UNREAD']}).execute()
+        add_label_to_email(service, message['id'], PROCESSED_LABEL)
 
 
 def job():
@@ -281,14 +289,20 @@ def job():
 def main():
     logging.info("Starting email fetching process")
     service = get_gmail_service()
-    last_timestamp = datetime.utcnow().strftime('%Y/%m/%d %H:%M:%S')
+    last_timestamp = get_last_timestamp()
+    if last_timestamp:
+        logging.info(f"Last timestamp: {last_timestamp}")
+    else:
+        logging.info("No last timestamp found, fetching all unread emails")
+
+    new_timestamp = datetime.utcnow().strftime('%Y/%m/%d %H:%M:%S')
     messages = fetch_emails(service, last_timestamp)
     logging.info(f"Fetched {len(messages)} messages")
 
     if messages:
         for message in messages:
             process_email(service, message)
-        update_last_timestamp(last_timestamp)
+        update_last_timestamp(new_timestamp)
 
 
 if __name__ == "__main__":
