@@ -2,7 +2,6 @@ from __future__ import print_function
 import re
 import os
 import base64
-import schedule
 import time
 import pdfplumber
 from datetime import datetime, timedelta
@@ -15,13 +14,19 @@ from transformers import DonutProcessor, VisionEncoderDecoderModel
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
+from email.mime.application import MIMEApplication
 from email import encoders
 from PIL import Image
 import logging
 import json
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.pdfgen import canvas
+from io import BytesIO
+import email
 
 # Configure logging
-logging.basicConfig(level=logging.INFO,
+logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Scopes and credentials
@@ -118,11 +123,12 @@ def is_invoice(text):
 
 def fetch_emails(service, last_timestamp):
     try:
-        query = f'is:unread'  # Adjusted query for debugging
-        logging.info(
-            f"Fetching unread emails received after: {last_timestamp}")
+        query = f'in:inbox after:{last_timestamp}'
+        logging.info(f"Querying emails with: {query}")
         results = service.users().messages().list(userId='me', q=query).execute()
         messages = results.get('messages', [])
+        logging.info(f"Full API response: {results}")
+        logging.info(f"Number of messages fetched: {len(messages)}")
         return messages
     except HttpError as error:
         logging.error(f'An error occurred: {error}')
@@ -169,54 +175,90 @@ def extract_invoice_info(pdf_path):
         return None, None
 
 
-def forward_email(service, message_id, receiver_email, snippet):
+def create_pdf_from_text(text):
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+
+    c.setFont("Helvetica", 10)
+    x_margin = 0.5 * inch
+    y_margin = height - 0.5 * inch
+    line_height = 12
+
+    lines = text.split('\n')
+    y_position = y_margin
+
+    for line in lines:
+        if not line.strip():
+            y_position -= line_height  # Add space for empty lines
+        else:
+            if "Invoice #" in line or "Date:" in line:
+                c.setFont("Helvetica-Bold", 12)
+            elif "From:" in line or "To:" in line:
+                c.setFont("Helvetica-Bold", 10)
+                y_position -= line_height  # Add space before these lines
+            elif "Description of Services:" in line:
+                c.setFont("Helvetica-Bold", 10)
+                y_position -= line_height  # Add space before these lines
+            else:
+                c.setFont("Helvetica", 10)
+
+            c.drawString(x_margin, y_position, line.strip())
+            y_position -= line_height
+
+    c.save()
+    buffer.seek(0)
+    return buffer
+
+
+def clean_email_body(body):
+    # Remove unwanted HTML tags
+    body = re.sub(r'<div dir="ltr">', '', body)
+    body = re.sub(r'Sender Information:<br>', '', body)
+    body = re.sub(r'</div>', '', body)
+    return body
+
+
+def forward_email(service, message_id, receiver_email, invoice_in_body=False):
     try:
-        logging.info(f"Fetching full email for message ID: {message_id}")
         msg = service.users().messages().get(
-            userId='me', id=message_id, format='full').execute()
+            userId='me', id=message_id, format='raw').execute()
 
-        headers = msg.get('payload', {}).get('headers', [])
-        parts = msg.get('payload', {}).get('parts', [])
-
-        subject = None
-        for header in headers:
-            if header['name'] == 'Subject':
-                subject = header['value']
-                break
-
-        if not subject:
-            subject = "No Subject"
+        raw_msg = base64.urlsafe_b64decode(msg['raw'].encode('ASCII'))
+        email_message = email.message_from_bytes(raw_msg)
 
         forward = MIMEMultipart()
         forward['to'] = receiver_email
         forward['from'] = 'me'
-        forward['subject'] = "Fwd: " + subject
+        forward['subject'] = "Fwd: " + email_message['subject']
 
-        body = MIMEText(
-            f"Forwarding the following email:\n\n{snippet}\n\n", 'plain')
-        forward.attach(body)
+        body = ""
+        attached_filenames = set()
+        for part in email_message.walk():
+            if part.get_content_maintype() == 'multipart':
+                continue
+            if part.get_content_type() == 'text/plain':
+                body += part.get_payload(decode=True).decode('utf-8')
+            if part.get('Content-Disposition') is not None:
+                if 'attachment' in part.get('Content-Disposition'):
+                    if part.get_filename() not in attached_filenames:
+                        forward.attach(part)
+                        attached_filenames.add(part.get_filename())
 
-        for part in parts:
-            if part['mimeType'] == 'text/plain':
-                text_part = MIMEText(base64.urlsafe_b64decode(
-                    part['body']['data']).decode('utf-8'), 'plain')
-                forward.attach(text_part)
-            elif part['mimeType'] == 'text/html':
-                html_part = MIMEText(base64.urlsafe_b64decode(
-                    part['body']['data']).decode('utf-8'), 'html')
-                forward.attach(html_part)
-            elif 'attachmentId' in part['body']:
-                attachment = service.users().messages().attachments().get(
-                    userId='me', messageId=message_id, id=part['body']['attachmentId']).execute()
-                data = base64.urlsafe_b64decode(attachment['data'])
-                att = MIMEBase('application', 'octet-stream')
-                att.set_payload(data)
-                encoders.encode_base64(att)
-                att.add_header('Content-Disposition',
-                               'attachment', filename=part['filename'])
-                forward.attach(att)
+        # Clean the email body
+        body = clean_email_body(body)
+        forward.attach(MIMEText(body, 'plain'))
 
-        logging.info(f"Forwarding email to: {receiver_email}")
+        # If invoice is in the body, create and attach PDF
+        if invoice_in_body:
+            pdf_buffer = create_pdf_from_text(body)
+            pdf_attachment = MIMEApplication(
+                pdf_buffer.getvalue(), _subtype="pdf")
+            pdf_attachment.add_header(
+                'Content-Disposition', 'attachment', filename="invoice.pdf")
+            forward.attach(pdf_attachment)
+
+        # Send the email
         raw_forward = {'raw': base64.urlsafe_b64encode(
             forward.as_bytes()).decode('UTF-8')}
         sent_message = service.users().messages().send(
@@ -224,17 +266,13 @@ def forward_email(service, message_id, receiver_email, snippet):
         logging.info(
             f"Email forwarded successfully to {receiver_email}. Sent message ID: {sent_message['id']}")
 
-        logging.info(f"Marking email as read: {message_id}")
+        # Mark original email as read and add processed label
         service.users().messages().modify(userId='me', id=message_id,
                                           body={'removeLabelIds': ['UNREAD']}).execute()
-
         add_label_to_email(service, message_id, PROCESSED_LABEL)
+
     except HttpError as error:
-        if error.resp.status in [403, 429]:
-            logging.error(f"Quota exceeded: {error}")
-        else:
-            logging.error(
-                f"Error forwarding email to {receiver_email}: {error}")
+        logging.error(f"Error forwarding email: {error}")
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
 
@@ -242,58 +280,76 @@ def forward_email(service, message_id, receiver_email, snippet):
 def process_email(service, message):
     msg = service.users().messages().get(
         userId='me', id=message['id']).execute()
-    msg_body = msg['snippet']
-    logging.info(
-        f"Processing message ID {message['id']} with snippet: {msg_body[:100]}")
-    email_contains_invoice = is_invoice(msg_body)
 
-    attachments = []
+    # Get the full email body
+    full_body = ""
     if 'parts' in msg['payload']:
         for part in msg['payload']['parts']:
-            if part['filename'] and 'attachmentId' in part['body']:
+            if part['mimeType'] == 'text/plain':
+                full_body += base64.urlsafe_b64decode(
+                    part['body']['data']).decode('utf-8')
+    else:
+        full_body = base64.urlsafe_b64decode(
+            msg['payload']['body']['data']).decode('utf-8')
+
+    logging.info(f"Processing message ID {message['id']}")
+    # Log the first 500 characters of the email body
+    logging.debug(f"Email body: {full_body[:500]}...")
+
+    invoice_in_attachment = False
+    invoice_in_body = False
+
+    # Check attachments for invoice
+    if 'parts' in msg['payload']:
+        for part in msg['payload']['parts']:
+            if part['filename'] and part['filename'].lower().endswith('.pdf'):
                 attachment = service.users().messages().attachments().get(
                     userId='me', messageId=message['id'], id=part['body']['attachmentId']
                 ).execute()
                 data = base64.urlsafe_b64decode(
                     attachment['data'].encode('UTF-8'))
-                path = os.path.join(ATTACHMENTS_DIR, part['filename'])
-                with open(path, 'wb') as f:
+
+                # Save attachment temporarily
+                temp_path = os.path.join(ATTACHMENTS_DIR, part['filename'])
+                with open(temp_path, 'wb') as f:
                     f.write(data)
-                attachments.append(path)
-                logging.info(f"Downloaded attachment to {path}")
 
-    invoice_detected = email_contains_invoice
-    for pdf in attachments:
-        if pdf.lower().endswith('.pdf'):
-            invoice_data, _ = extract_invoice_info(pdf)
-            if invoice_data:
-                invoice_detected = True
+                # Check if it's an invoice
+                invoice_data, _ = extract_invoice_info(temp_path)
+                if invoice_data:
+                    invoice_in_attachment = True
+                    logging.info(
+                        f"Invoice detected in attachment: {part['filename']}")
+                    break
 
-    if invoice_detected:
-        forward_email(service, message['id'], RECEIVER_EMAIL, msg_body)
-        logging.info(
-            f"Invoice detected and email forwarded for message ID {message['id']}")
-    else:
-        logging.info(f"No invoice detected in message ID {message['id']}")
-        # Mark the email as read even if no invoice is detected
-        service.users().messages().modify(userId='me', id=message['id'],
-                                          body={'removeLabelIds': ['UNREAD']}).execute()
-        add_label_to_email(service, message['id'], PROCESSED_LABEL)
+                # Remove temporary file if not an invoice
+                os.remove(temp_path)
 
+    # If no invoice in attachment, check body
+    if not invoice_in_attachment:
+        invoice_in_body = is_invoice(full_body)
+        if invoice_in_body:
+            logging.info("Invoice detected in email body")
 
-def job():
-    logging.info("Running scheduled job to check emails...")
-    main()
+    # Forward the email with the body and any detected invoice attachment
+    forward_email(service, message['id'], RECEIVER_EMAIL, invoice_in_body)
+    logging.info(
+        f"Email forwarded for message ID {message['id']}")
+
+    # Mark the email as read and add processed label
+    service.users().messages().modify(userId='me', id=message['id'], body={
+        'removeLabelIds': ['UNREAD']}).execute()
+    add_label_to_email(service, message['id'], PROCESSED_LABEL)
 
 
 def main():
     logging.info("Starting email fetching process")
     service = get_gmail_service()
-    last_timestamp = get_last_timestamp()
-    if last_timestamp:
-        logging.info(f"Last timestamp: {last_timestamp}")
-    else:
-        logging.info("No last timestamp found, fetching all unread emails")
+    # Get the timestamp for 48 hours ago
+    last_timestamp = (datetime.utcnow() - timedelta(hours=24)
+                      ).strftime('%Y/%m/%d')
+    logging.info(
+        f"Fetching emails received in the last 24 hours (after timestamp: {last_timestamp})")
 
     new_timestamp = datetime.utcnow().strftime('%Y/%m/%d %H:%M:%S')
     messages = fetch_emails(service, last_timestamp)
@@ -303,16 +359,11 @@ def main():
         for message in messages:
             process_email(service, message)
         update_last_timestamp(new_timestamp)
+    else:
+        logging.info("No new emails found")
+
+    logging.info("Email fetching process completed")
 
 
 if __name__ == "__main__":
-    schedule.every(1).minutes.do(job)
-
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
-
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    main()
