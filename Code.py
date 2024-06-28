@@ -32,7 +32,7 @@ logging.basicConfig(level=logging.DEBUG,
 # Scopes and credentials
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send',
           'https://www.googleapis.com/auth/gmail.compose', 'https://mail.google.com/']
-CREDENTIALS_PATH = 'C:\\Users\\User\\Documents\\GitHub\\elena_project\\autogen\\jsonclient_secret_864676982851-49gtof7lldbis507iao7r0f0r6v95jvl.apps.googleusercontent.com.json'
+CREDENTIALS_PATH = 'C:\\Users\\User\\Documents\\GitHub\\elena_project\\Email-automation\\jsonclient_secret_864676982851-49gtof7lldbis507iao7r0f0r6v95jvl.apps.googleusercontent.com.json'
 PROCESSED_LABEL = 'processed'
 ATTACHMENTS_DIR = './attachments'
 RECEIVER_EMAIL = "elena@jarccel.com"
